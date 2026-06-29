@@ -19,7 +19,7 @@ struct AppConfig: Codable {
 }
 
 // MARK: - Gestionnaire de Backup
-class BackupManager: ObservableObject {
+class BackupManager: NSObject, ObservableObject {
     @Published var config: AppConfig = AppConfig()
     @Published var isRunning = false
     @Published var isListing = false
@@ -33,20 +33,111 @@ class BackupManager: ObservableObject {
     
     private let configURL: URL
     private var autoBackupTimer: Timer?
+    private var statusItem: NSStatusItem?
+    private var statusCancellables: Set<AnyCancellable> = []
     
-    init() {
+    override init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let appFolder = appSupport.appendingPathComponent("DuplicityManager", isDirectory: true)
         try? FileManager.default.createDirectory(at: appFolder, withIntermediateDirectories: true)
         configURL = appFolder.appendingPathComponent("config.json")
-        
+
+        super.init()
+
         loadConfig()
         checkStatus()
         setupAutoBackup()
+        setupStatusBarItem()
     }
     
     deinit {
         autoBackupTimer?.invalidate()
+    }
+
+    // MARK: - Icône de la barre de menu
+
+    private func setupStatusBarItem() {
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+
+        let menu = NSMenu()
+        let openItem = NSMenuItem(title: "Ouvrir DuplicityManager",
+                                  action: #selector(showWindow),
+                                  keyEquivalent: "o")
+        openItem.target = self
+        menu.addItem(openItem)
+        menu.addItem(NSMenuItem.separator())
+        let backupItem = NSMenuItem(title: "Lancer un backup",
+                                    action: #selector(menuRunBackup),
+                                    keyEquivalent: "b")
+        backupItem.target = self
+        menu.addItem(backupItem)
+        menu.addItem(NSMenuItem.separator())
+        let quitItem = NSMenuItem(title: "Quitter",
+                                  action: #selector(quitApp),
+                                  keyEquivalent: "q")
+        quitItem.target = self
+        menu.addItem(quitItem)
+        statusItem?.menu = menu
+
+        // Observe les changements d'état pour mettre à jour l'icône
+        $isRunning
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusBarIcon() }
+            .store(in: &statusCancellables)
+        $lastBackupStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusBarIcon() }
+            .store(in: &statusCancellables)
+        $config
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.updateStatusBarIcon() }
+            .store(in: &statusCancellables)
+
+        // Définit l'icône initiale selon l'état réel
+        updateStatusBarIcon()
+    }
+
+    private func updateStatusBarIcon() {
+        let symbolName: String
+        let tooltip: String
+
+        if isRunning {
+            symbolName = "arrow.clockwise.circle.fill"
+            tooltip = "DuplicityManager — Backup en cours..."
+        } else if lastBackupStatus == "Échec" {
+            symbolName = "exclamationmark.circle.fill"
+            tooltip = "DuplicityManager — Échec du dernier backup"
+        } else if config.autoBackupEnabled {
+            symbolName = "arrow.clockwise.circle.fill"
+            tooltip = "DuplicityManager — Sauvegarde automatique activée"
+        } else {
+            symbolName = "arrow.clockwise.circle"
+            tooltip = "DuplicityManager — En attente"
+        }
+
+        if let button = statusItem?.button {
+            button.image = NSImage(systemSymbolName: symbolName,
+                                   accessibilityDescription: tooltip)
+            button.image?.isTemplate = true
+            button.toolTip = tooltip
+        }
+    }
+
+    @objc private func showWindow() {
+        if let appDelegate = NSApplication.shared.delegate as? AppDelegate {
+            appDelegate.reopenMainWindow()
+        } else {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            NSApp.windows.first?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func menuRunBackup() {
+        runBackup()
+    }
+
+    @objc private func quitApp() {
+        NSApplication.shared.terminate(nil)
     }
     
     func loadConfig() {
