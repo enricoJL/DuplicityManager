@@ -30,6 +30,10 @@ class BackupManager: NSObject, ObservableObject {
     @Published var showAlert = false
     @Published var alertMessage = ""
     @Published var nextAutoBackupDate: String = "Désactivé"
+    @Published var isRestoring = false
+    @Published var restoreLog: String = "En attente de restore..."
+    @Published var restoreDestDir: String = "~/Desktop/DuplicityManager-Restore"
+    @Published var restoreFile: String = ""
     
     private let configURL: URL
     private var autoBackupTimer: Timer?
@@ -428,6 +432,198 @@ class BackupManager: NSObject, ObservableObject {
             self.isListing = false
         }
     }
+
+    // MARK: - Restore
+
+    /// Vide le répertoire de destination avant un restore pour éviter la corruption
+    private func cleanRestoreDest() -> Bool {
+        let destPath = (restoreDestDir as NSString).expandingTildeInPath
+
+        // Si un fichier existe à cet emplacement (et non un dossier), on le supprime
+        if FileManager.default.fileExists(atPath: destPath) {
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: destPath, isDirectory: &isDir)
+            if !isDir.boolValue {
+                // C'est un fichier, on le supprime
+                do {
+                    try FileManager.default.removeItem(atPath: destPath)
+                    restoreLog += "--- Ancien fichier supprimé à l'emplacement de destination.\n"
+                } catch {
+                    restoreLog += "--- ERREUR: Impossible de supprimer l'ancien fichier : \(error.localizedDescription)\n"
+                    return false
+                }
+            } else {
+                // C'est un dossier, on vide son contenu
+                do {
+                    let contents = try FileManager.default.contentsOfDirectory(atPath: destPath)
+                    for item in contents {
+                        let itemPath = (destPath as NSString).appendingPathComponent(item)
+                        try FileManager.default.removeItem(atPath: itemPath)
+                    }
+                    restoreLog += "--- Répertoire de destination nettoyé.\n"
+                } catch {
+                    restoreLog += "--- ERREUR: Impossible de nettoyer le répertoire : \(error.localizedDescription)\n"
+                    return false
+                }
+            }
+        }
+
+        // Crée le répertoire s'il n'existe pas
+        try? FileManager.default.createDirectory(atPath: destPath,
+                                                  withIntermediateDirectories: true)
+        return true
+    }
+
+    func runFullRestore() {
+        isRestoring = true
+        restoreLog = "Démarrage du restore complet...\n"
+
+        guard cleanRestoreDest() else {
+            isRestoring = false
+            alertMessage = "Impossible de nettoyer le répertoire de destination."
+            showAlert = true
+            return
+        }
+
+        let destPath = (restoreDestDir as NSString).expandingTildeInPath
+        restoreLog += "Restauration vers \(destPath)...\n"
+
+        let args = [
+            "--no-encryption",
+            "restore",
+            "ftp://\(config.ftpUser)@\(config.ftpHost)\(config.ftpPath)",
+            destPath
+        ]
+
+        runDuplicity(args: args) { output, success in
+            self.restoreLog += output + "\n"
+            if success {
+                self.restoreLog += "=== Restore réussi : \(self.nowString()) ===\n"
+            } else {
+                self.restoreLog += "=== ERREUR de restore : \(self.nowString()) ===\n"
+                self.alertMessage = "Le restore a échoué. Consultez les logs."
+                self.showAlert = true
+            }
+            self.isRestoring = false
+        }
+    }
+
+    func runPartialRestore() {
+        let trimmedFile = restoreFile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedFile.isEmpty else {
+            alertMessage = "Veuillez indiquer un fichier ou dossier à restaurer."
+            showAlert = true
+            return
+        }
+
+        isRestoring = true
+        restoreLog = "Démarrage du restore de « \(trimmedFile) »...\n"
+
+        guard cleanRestoreDest() else {
+            isRestoring = false
+            alertMessage = "Impossible de nettoyer le répertoire de destination."
+            showAlert = true
+            return
+        }
+
+        let destPath = (restoreDestDir as NSString).expandingTildeInPath
+
+        // Duplicity restaure le fichier directement au chemin de destination,
+        // ce qui remplace le dossier par le fichier. On utilise donc un
+        // sous-dossier temporaire comme cible : duplicity créera le fichier
+        // À L'INTÉRIEUR de ce sous-dossier.
+        let tempBase = FileManager.default.temporaryDirectory
+            .appendingPathComponent("duplicity-restore-\(Int(Date().timeIntervalSince1970))")
+        // tempBase est le dossier parent qu'on garde
+        // tempTarget est le sous-dossier que duplicity va utiliser comme destination
+        let tempTarget = tempBase.appendingPathComponent("restore-output")
+        try? FileManager.default.createDirectory(at: tempTarget,
+                                                  withIntermediateDirectories: true)
+
+        restoreLog += "Restauration vers \(destPath) (via \(tempTarget.path))...\n"
+
+        let args = [
+            "--no-encryption",
+            "--path-to-restore", trimmedFile,
+            "restore",
+            "ftp://\(config.ftpUser)@\(config.ftpHost)\(config.ftpPath)",
+            tempTarget.path
+        ]
+
+        runDuplicity(args: args) { output, success in
+            self.restoreLog += output + "\n"
+
+            if success {
+                // Duplicity a remplacé le sous-dossier "restore-output" par le fichier
+                // restauré. On lit donc le contenu depuis le dossier parent (tempBase).
+                // On renomme le fichier avec le nom original (basename du chemin demandé).
+                let originalName = (trimmedFile as NSString).lastPathComponent
+                do {
+                    let contents = try FileManager.default.contentsOfDirectory(atPath: tempBase.path)
+                    for item in contents {
+                        let srcPath = (tempBase.path as NSString).appendingPathComponent(item)
+                        let dstPath = (destPath as NSString).appendingPathComponent(originalName)
+                        // Supprime l'élément existant à la destination s'il y en a un
+                        if FileManager.default.fileExists(atPath: dstPath) {
+                            try FileManager.default.removeItem(atPath: dstPath)
+                        }
+                        try FileManager.default.moveItem(atPath: srcPath, toPath: dstPath)
+                    }
+                    try? FileManager.default.removeItem(at: tempBase)
+                    self.restoreLog += "=== Restore réussi : \(originalName) → \(destPath) (\(self.nowString())) ===\n"
+                } catch {
+                    self.restoreLog += "=== ERREUR lors du déplacement : \(error.localizedDescription) ===\n"
+                    self.alertMessage = "Le restore a réussi mais le déplacement a échoué : \(error.localizedDescription)"
+                    self.showAlert = true
+                }
+            } else {
+                self.restoreLog += "=== ERREUR de restore : \(self.nowString()) ===\n"
+                self.alertMessage = "Le restore a échoué. Consultez les logs."
+                self.showAlert = true
+            }
+            self.isRestoring = false
+        }
+    }
+
+    func openRestoreDestInFinder() {
+        let destPath = (restoreDestDir as NSString).expandingTildeInPath
+        if FileManager.default.fileExists(atPath: destPath) {
+            NSWorkspace.shared.open(URL(fileURLWithPath: destPath))
+        } else {
+            // Crée le répertoire s'il n'existe pas
+            try? FileManager.default.createDirectory(atPath: destPath,
+                                                      withIntermediateDirectories: true)
+            NSWorkspace.shared.open(URL(fileURLWithPath: destPath))
+        }
+    }
+
+    func clearRestoreDest() {
+        let destPath = (restoreDestDir as NSString).expandingTildeInPath
+        if FileManager.default.fileExists(atPath: destPath) {
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: destPath, isDirectory: &isDir)
+            do {
+                if isDir.boolValue {
+                    // Vide le contenu du dossier
+                    let contents = try FileManager.default.contentsOfDirectory(atPath: destPath)
+                    for item in contents {
+                        let itemPath = (destPath as NSString).appendingPathComponent(item)
+                        try FileManager.default.removeItem(atPath: itemPath)
+                    }
+                    restoreLog = "--- Répertoire vidé : \(destPath)\n"
+                } else {
+                    // Supprime le fichier
+                    try FileManager.default.removeItem(atPath: destPath)
+                    restoreLog = "--- Fichier supprimé : \(destPath)\n"
+                }
+            } catch {
+                alertMessage = "Impossible de vider : \(error.localizedDescription)"
+                showAlert = true
+            }
+        } else {
+            restoreLog = "--- Le répertoire n'existe pas encore.\n"
+        }
+    }
     
     private func runDuplicity(args: [String], completion: @escaping (String, Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
@@ -567,6 +763,87 @@ struct ContentView: View {
             }
             .tabItem {
                 Label("Fichiers", systemImage: "doc.on.doc")
+            }
+            
+            // MARK: Récupération
+            VStack {
+                HStack {
+                    Text("Récupération")
+                        .font(.title2)
+                        .bold()
+                    Spacer()
+                }
+                .padding()
+
+                VStack(alignment: .leading, spacing: 15) {
+                    // Destination
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Répertoire de destination")
+                            .font(.headline)
+                        HStack {
+                            TextField("~/Desktop/DuplicityManager-Restore",
+                                      text: $manager.restoreDestDir)
+                                .textFieldStyle(.roundedBorder)
+                            Button(action: {
+                                manager.openRestoreDestInFinder()
+                            }) {
+                                Label("Ouvrir", systemImage: "folder")
+                            }
+                            Button(action: {
+                                manager.clearRestoreDest()
+                            }) {
+                                Label("Vider", systemImage: "trash")
+                            }
+                        }
+                    }
+
+                    // Restore partiel
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Fichier ou dossier à récupérer (optionnel)")
+                            .font(.headline)
+                        TextField("ex: Documents/monfichier.txt",
+                                  text: $manager.restoreFile)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Indiquez le chemin tel qu'affiché dans l'onglet Fichiers. Laissez vide pour une récupération complète.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Bouton
+                    Button(action: {
+                        if manager.restoreFile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                            manager.runFullRestore()
+                        } else {
+                            manager.runPartialRestore()
+                        }
+                    }) {
+                        Label(manager.isRestoring ? "Récupération en cours..." : "Lancer la récupération",
+                              systemImage: "arrow.down.circle.fill")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(manager.isRestoring)
+                }
+                .padding(.horizontal)
+
+                ScrollView {
+                    Text(manager.restoreLog)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                }
+                .background(Color(NSColor.textBackgroundColor))
+                .cornerRadius(8)
+                .padding(.horizontal)
+            }
+            .tabItem {
+                Label("Récupération", systemImage: "arrow.uturn.down.circle")
+            }
+            .alert("Problème de Backup", isPresented: $manager.showAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(manager.alertMessage)
             }
             
             // MARK: Configuration
