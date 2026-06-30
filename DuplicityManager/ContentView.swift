@@ -34,6 +34,7 @@ class BackupManager: NSObject, ObservableObject {
     @Published var restoreLog: String = "En attente de restore..."
     @Published var restoreDestDir: String = "~/Desktop/DuplicityManager-Restore"
     @Published var restoreFile: String = ""
+    @Published var restoreTime: String = ""
     @Published var fileSearchText: String = ""
     @Published var fileCount: Int = 0
     private var listProcess: Process?
@@ -219,22 +220,78 @@ class BackupManager: NSObject, ObservableObject {
         }
 
         // Met à jour l'affichage de la prochaine échéance
-        let nextDate = Date(timeIntervalSince1970: lastBackupTime + interval)
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        nextAutoBackupDate = formatter.string(from: nextDate)
+        updateNextBackupDate()
+    }
+
+    private func updateNextBackupDate() {
+        guard config.autoBackupEnabled else {
+            nextAutoBackupDate = "Désactivé"
+            return
+        }
+
+        let appStamp = configURL.deletingLastPathComponent().appendingPathComponent("last-backup-stamp").path
+        let systemStamp = "/var/log/duplicity-last-run"
+
+        var lastBackupTime: TimeInterval = 0
+        if let content = try? String(contentsOfFile: appStamp, encoding: .utf8),
+           let ts = TimeInterval(content) {
+            lastBackupTime = ts
+        }
+        if let content = try? String(contentsOfFile: systemStamp, encoding: .utf8),
+           let ts = TimeInterval(content), ts > lastBackupTime {
+            lastBackupTime = ts
+        }
+
+        let interval = TimeInterval(config.autoBackupIntervalHours * 3600)
+
+        if lastBackupTime > 0 {
+            let nextDate = Date(timeIntervalSince1970: lastBackupTime + interval)
+            let formatter = DateFormatter()
+            formatter.dateStyle = .medium
+            formatter.timeStyle = .short
+            nextAutoBackupDate = formatter.string(from: nextDate)
+        } else {
+            nextAutoBackupDate = "En cours / imminent"
+        }
     }
     
     func checkStatus() {
         let expandedLogPath = (config.logFile as NSString).expandingTildeInPath
         if FileManager.default.fileExists(atPath: expandedLogPath) {
             if let content = try? String(contentsOfFile: expandedLogPath, encoding: .utf8) {
-                backupLog = content
+                let lines = content.components(separatedBy: "\n")
+
+                // Trouve tous les marqueurs de fin de session
+                var markerIndices: [Int] = []
+                for (i, line) in lines.enumerated() {
+                    if line.contains("=== Backup réussi") || line.contains("=== ERREUR") {
+                        markerIndices.append(i)
+                    }
+                }
+
+                // Affiche seulement la dernière session complète :
+                // du marqueur précédent (exclus) au dernier marqueur (inclus)
+                if markerIndices.count >= 2 {
+                    let lastMarker = markerIndices.last!
+                    let prevMarker = markerIndices[markerIndices.count - 2]
+                    let lastSession = lines[(prevMarker + 1)...lastMarker]
+                        .joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    backupLog = lastSession
+                } else if markerIndices.count == 1 {
+                    // Une seule session : du début au marqueur
+                    let lastMarker = markerIndices.first!
+                    let lastSession = lines[0...lastMarker]
+                        .joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    backupLog = lastSession
+                } else {
+                    // Aucun marqueur : affiche tout
+                    backupLog = content
+                }
 
                 // Cherche la dernière occurrence de "réussi" ou "ERREUR"
                 // pour déterminer le statut réel du backup le plus récent
-                let lines = content.components(separatedBy: "\n")
                 var lastStatus: String = "Inconnu"
                 for line in lines {
                     if line.contains("=== Backup réussi") {
@@ -255,6 +312,8 @@ class BackupManager: NSObject, ObservableObject {
                 updateLastBackupDate(from: content)
             }
         }
+
+        updateNextBackupDate()
     }
 
     private func updateLastBackupDate(from logContent: String) {
@@ -374,6 +433,7 @@ class BackupManager: NSObject, ObservableObject {
                 self.appendLogToDisk("=== Backup réussi : \(self.nowString()) ===")
             }
             self.checkStatus()
+            self.updateNextBackupDate()
         }
     }
 
@@ -577,12 +637,18 @@ class BackupManager: NSObject, ObservableObject {
         let destPath = (restoreDestDir as NSString).expandingTildeInPath
         restoreLog += "Restauration vers \(destPath)...\n"
 
-        let args = [
-            "--no-encryption",
+        var args = [
+            "--no-encryption"
+        ]
+        let trimmedTime = restoreTime.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTime.isEmpty {
+            args.append(contentsOf: ["--time", trimmedTime])
+        }
+        args.append(contentsOf: [
             "restore",
             "ftp://\(config.ftpUser)@\(config.ftpHost)\(config.ftpPath)",
             destPath
-        ]
+        ])
 
         runDuplicity(args: args) { output, success in
             self.restoreLog += output + "\n"
@@ -631,13 +697,19 @@ class BackupManager: NSObject, ObservableObject {
 
         restoreLog += "Restauration vers \(destPath) (via \(tempTarget.path))...\n"
 
-        let args = [
-            "--no-encryption",
+        var args = [
+            "--no-encryption"
+        ]
+        let trimmedTime = restoreTime.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedTime.isEmpty {
+            args.append(contentsOf: ["--time", trimmedTime])
+        }
+        args.append(contentsOf: [
             "--path-to-restore", trimmedFile,
             "restore",
             "ftp://\(config.ftpUser)@\(config.ftpHost)\(config.ftpPath)",
             tempTarget.path
-        ]
+        ])
 
         runDuplicity(args: args) { output, success in
             self.restoreLog += output + "\n"
@@ -916,6 +988,18 @@ struct ContentView: View {
                                   text: $manager.restoreFile)
                             .textFieldStyle(.roundedBorder)
                         Text("Indiquez le chemin tel qu'affiché dans l'onglet Fichiers. Laissez vide pour une récupération complète.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Date de restauration
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Date de restauration (optionnel)")
+                            .font(.headline)
+                        TextField("ex: 2026-06-28 ou 3D ou 1W",
+                                  text: $manager.restoreTime)
+                            .textFieldStyle(.roundedBorder)
+                        Text("Restaure l'état du backup à cette date. Formats acceptés : YYYY-MM-DD, 3D (3 jours), 1W (1 semaine), 1M (1 mois). Laissez vide pour la version la plus récente.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
