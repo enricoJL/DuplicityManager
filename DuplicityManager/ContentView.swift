@@ -24,7 +24,7 @@ class BackupManager: NSObject, ObservableObject {
     @Published var isRunning = false
     @Published var isListing = false
     @Published var backupLog: String = "En attente de lancement..."
-    @Published var fileList: String = "Cliquez sur 'Rafraîchir' pour charger la liste."
+    @Published var fileLines: [String] = []
     @Published var lastBackupStatus: String = "Inconnu"
     @Published var lastBackupDate: String = "Jamais"
     @Published var showAlert = false
@@ -34,6 +34,9 @@ class BackupManager: NSObject, ObservableObject {
     @Published var restoreLog: String = "En attente de restore..."
     @Published var restoreDestDir: String = "~/Desktop/DuplicityManager-Restore"
     @Published var restoreFile: String = ""
+    @Published var fileSearchText: String = ""
+    @Published var fileCount: Int = 0
+    private var listProcess: Process?
     
     private let configURL: URL
     private var autoBackupTimer: Timer?
@@ -423,14 +426,100 @@ class BackupManager: NSObject, ObservableObject {
     
     func refreshFiles() {
         isListing = true
-        fileList = "Chargement..."
-        
+        fileLines = []
+        fileCount = 0
+
         let args = ["list-current-files", "ftp://\(config.ftpUser)@\(config.ftpHost)\(config.ftpPath)"]
-        
-        runDuplicity(args: args) { output, _ in
-            self.fileList = output
-            self.isListing = false
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+
+            var env = ProcessInfo.processInfo.environment
+            env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:" + (env["PATH"] ?? "")
+            env["BACKEND_PASSWORD"] = self.config.ftpPass
+            process.environment = env
+
+            process.arguments = ["duplicity"] + args
+
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = pipe
+
+            // Lecture ligne par ligne en streaming
+            // On accumule dans un buffer local et on pousse par lots
+            // pour éviter de rafraîchir l'UI à chaque ligne.
+            var buffer = ""
+            var batch: [String] = []
+            let batchSize = 200
+
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if data.isEmpty {
+                    // Fin du flux : pousser le reste du buffer
+                    if !buffer.isEmpty {
+                        batch.append(buffer)
+                        buffer = ""
+                    }
+                    if !batch.isEmpty {
+                        let finalBatch = batch
+                        DispatchQueue.main.async {
+                            self.fileLines.append(contentsOf: finalBatch)
+                            self.fileCount = self.fileLines.count
+                        }
+                    }
+                    handle.readabilityHandler = nil
+                    return
+                }
+                if let chunk = String(data: data, encoding: .utf8) {
+                    buffer += chunk
+                    while let nlRange = buffer.range(of: "\n") {
+                        let line = String(buffer[..<nlRange.lowerBound])
+                        buffer = String(buffer[nlRange.upperBound...])
+                        if !line.isEmpty {
+                            batch.append(line)
+                            if batch.count >= batchSize {
+                                let pushBatch = batch
+                                batch = []
+                                DispatchQueue.main.async {
+                                    self.fileLines.append(contentsOf: pushBatch)
+                                    self.fileCount = self.fileLines.count
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            do {
+                self.listProcess = process
+                try process.run()
+                process.waitUntilExit()
+
+                DispatchQueue.main.async {
+                    self.isListing = false
+                    self.listProcess = nil
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.fileLines = ["Erreur: \(error.localizedDescription)"]
+                    self.isListing = false
+                    self.listProcess = nil
+                }
+            }
         }
+    }
+
+    func cancelFileList() {
+        listProcess?.terminate()
+        listProcess = nil
+        isListing = false
+        fileLines.append("--- Liste interrompue par l'utilisateur ---")
+    }
+
+    var filteredFileLines: [String] {
+        guard !fileSearchText.isEmpty else { return fileLines }
+        return fileLines.filter { $0.localizedCaseInsensitiveContains(fileSearchText) }
     }
 
     // MARK: - Restore
@@ -742,24 +831,46 @@ struct ContentView: View {
                         .font(.title2)
                         .bold()
                     Spacer()
-                    Button(action: {
-                        manager.refreshFiles()
-                    }) {
-                        Label("Rafraîchir", systemImage: "arrow.clockwise")
+                    if manager.isListing {
+                        Button(action: {
+                            manager.cancelFileList()
+                        }) {
+                            Label("Annuler", systemImage: "xmark.circle")
+                        }
+                    } else {
+                        Button(action: {
+                            manager.refreshFiles()
+                        }) {
+                            Label("Rafraîchir", systemImage: "arrow.clockwise")
+                        }
                     }
-                    .disabled(manager.isListing)
                 }
                 .padding()
-                
-                ScrollView {
-                    Text(manager.fileList)
+
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundColor(.secondary)
+                    TextField("Rechercher un fichier...",
+                              text: $manager.fileSearchText)
+                        .textFieldStyle(.roundedBorder)
+                    if !manager.fileSearchText.isEmpty {
+                        Text("\(manager.filteredFileLines.count) / \(manager.fileCount)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else if manager.fileCount > 0 {
+                        Text("\(manager.fileCount) fichiers")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.horizontal)
+
+                List(manager.filteredFileLines, id: \.self) { line in
+                    Text(line)
                         .font(.system(.body, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
                         .textSelection(.enabled)
                 }
-                .background(Color(NSColor.textBackgroundColor))
-                .cornerRadius(8)
-                .padding(.horizontal)
+                .listStyle(.plain)
             }
             .tabItem {
                 Label("Fichiers", systemImage: "doc.on.doc")
@@ -932,6 +1043,7 @@ struct ContentView: View {
             return .orange
         }
     }
+
 }
 
 // MARK: - Preview
